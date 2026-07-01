@@ -1,0 +1,62 @@
+name: Build MeloNX iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-ios:
+    name: Build unsigned IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Build MeloNX
+        run: |
+          PROJECT="$(find . -name 'MeloNX.xcodeproj' -type d | head -n 1)"
+          if [ -z "$PROJECT" ]; then
+            echo "MeloNX.xcodeproj wurde nicht gefunden."
+            echo "Repo-Inhalt:"
+            find . -maxdepth 4 -type d | sort
+            exit 66
+          fi
+
+          echo "Gefundenes Xcode-Projekt: $PROJECT"
+          xcodebuild -list -project "$PROJECT"
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme MeloNX \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP="$(find build/Build/Products -name 'MeloNX.app' -type d | head -n 1)"
+          if [ -z "$APP" ]; then
+            echo "MeloNX.app wurde nach dem Build nicht gefunden."
+            find build -maxdepth 6 -type d | sort
+            exit 66
+          fi
+
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r MeloNX-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeloNX-unsigned-ipa
+          path: MeloNX-unsigned.ipa
