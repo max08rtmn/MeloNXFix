@@ -1,0 +1,205 @@
+name: Build MeloNX iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-ios:
+    name: Build unsigned IPA
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Unpack MeloNX source zip if present
+        run: |
+          ZIP="$(find . -maxdepth 2 \( -iname 'MeloNX*.zip' -o -iname '*melonx*.zip' \) | head -n 1)"
+
+          if [ -n "$ZIP" ] && [ ! -d "src/MeloNX" ]; then
+            echo "Entpacke MeloNX-Quellcode aus: $ZIP"
+            mkdir -p source-from-zip
+            unzip -q "$ZIP" -d source-from-zip
+          else
+            echo "Keine MeloNX-ZIP gefunden oder src/MeloNX existiert bereits."
+          fi
+
+      - name: Fix iOS build script permissions
+        run: |
+          find . -path '*/distribution/ios/*.sh' -exec chmod +x {} \;
+          find . -path '*/distribution/ios/*.sh' -exec ls -l {} \;
+
+      - name: Patch MeloNX source for Xcode 16 and Joy-Con buttons
+        run: |
+          ruby <<'RUBY'
+          def file(pattern)
+            path = Dir.glob(pattern).first
+            abort("Datei nicht gefunden: #{pattern}") unless path
+            path
+          end
+
+          project_root = File.dirname(file("**/MeloNX.xcodeproj"))
+          xcconfig = file("**/MeloNX.xcconfig")
+          text = File.read(xcconfig)
+          text = text.gsub(/^VERSION\s*=.*/, "VERSION = 2.3.1")
+          File.write(xcconfig, text)
+
+          compat_dir = File.join(project_root, "MeloNX", "App", "Core", "Compatibility")
+          Dir.mkdir(compat_dir) unless Dir.exist?(compat_dir)
+
+          # Xcode 16.4 kennt die neueren Liquid-Glass-APIs noch nicht. Da das Xcode-
+          # Projekt file-system-synchronized ist, wird diese Swift-Datei automatisch
+          # mitgebaut und stellt harmlose Ersatz-APIs bereit.
+          File.write(File.join(compat_dir, "Xcode16Compatibility.swift"), <<~'SWIFT')
+          import SwiftUI
+          import UIKit
+
+          struct GlassEffectContainer<Content: View>: View {
+              private let content: Content
+
+              init(@ViewBuilder content: () -> Content) {
+                  self.content = content()
+              }
+
+              var body: some View {
+                  content
+              }
+          }
+
+          struct MeloNXCompatibilityGlassEffect {
+              static var regular: MeloNXCompatibilityGlassEffect { MeloNXCompatibilityGlassEffect() }
+              static var clear: MeloNXCompatibilityGlassEffect { MeloNXCompatibilityGlassEffect() }
+
+              func tint(_ color: Color) -> MeloNXCompatibilityGlassEffect {
+                  self
+              }
+
+              func interactive() -> MeloNXCompatibilityGlassEffect {
+                  self
+              }
+          }
+
+          extension View {
+              func glassEffect<S: Shape>(_ effect: MeloNXCompatibilityGlassEffect, in shape: S) -> some View {
+                  self
+              }
+          }
+
+          extension ToolbarContent {
+              @ToolbarContentBuilder
+              func sharedBackgroundVisibility(_ visibility: Visibility) -> some ToolbarContent {
+                  self
+              }
+          }
+          SWIFT
+
+          alert = file("**/MacClassicAlert.swift")
+          text = File.read(alert)
+          text = text.gsub("UIGlassEffect(style: .regular)", "UIBlurEffect(style: .regular)")
+          File.write(alert, text)
+
+          layout = file("**/LayoutEditorView.swift")
+          text = File.read(layout)
+          text = text.gsub("\\(gameId, default: \"global\")", "\\(gameId ?? \"global\")")
+          File.write(layout, text)
+
+          puts "MeloNX build patches angewendet."
+          RUBY
+
+      - name: Build Ryujinx iOS dylib
+        run: |
+          PROJECT="$(find . -name 'MeloNX.xcodeproj' -type d | head -n 1)"
+          if [ -z "$PROJECT" ]; then
+            echo "MeloNX.xcodeproj wurde nicht gefunden."
+            exit 66
+          fi
+
+          ROOT="$(cd "$(dirname "$PROJECT")/../.." && pwd)"
+          cd "$ROOT"
+
+          dotnet publish \
+            -c Release \
+            -r ios-arm64 \
+            -p:ExtraDefineConstants=DISABLE_UPDATER \
+            src/Ryujinx.Headless.SDL2 \
+            --self-contained true
+
+          NATIVE_DYLIB="src/Ryujinx.Headless.SDL2/bin/Release/net8.0/ios-arm64/native/Ryujinx.Headless.SDL2.dylib"
+          APP_DYLIB="src/MeloNX/MeloNX/Dependencies/Dynamic Libraries/Ryujinx.Headless.SDL2.dylib"
+          LINK_DYLIB="build-link-libs/Ryujinx.Headless.SDL2.dylib"
+
+          if [ ! -f "$NATIVE_DYLIB" ]; then
+            echo "Ryujinx.Headless.SDL2.dylib wurde nicht gebaut."
+            find src/Ryujinx.Headless.SDL2/bin -name 'Ryujinx.Headless.SDL2.dylib' -print || true
+            exit 65
+          fi
+
+          mkdir -p "$(dirname "$APP_DYLIB")" build-link-libs
+          cp "$NATIVE_DYLIB" "$APP_DYLIB"
+          cp "$NATIVE_DYLIB" "$LINK_DYLIB"
+
+          echo "Dylib fuer MeloNX vorbereitet:"
+          ls -l "$APP_DYLIB" "$LINK_DYLIB"
+
+      - name: Build MeloNX
+        run: |
+          PROJECT="$(find . -name 'MeloNX.xcodeproj' -type d | head -n 1)"
+          if [ -z "$PROJECT" ]; then
+            echo "MeloNX.xcodeproj wurde nicht gefunden."
+            echo "Repo-Inhalt:"
+            find . -maxdepth 4 -type d | sort
+            exit 66
+          fi
+
+          echo "Gefundenes Xcode-Projekt: $PROJECT"
+          xcodebuild -list -project "$PROJECT"
+
+          ROOT="$(cd "$(dirname "$PROJECT")/../.." && pwd)"
+          LINK_DYLIB="$ROOT/build-link-libs/Ryujinx.Headless.SDL2.dylib"
+
+          if [ ! -f "$LINK_DYLIB" ]; then
+            echo "Link-Dylib fehlt: $LINK_DYLIB"
+            exit 65
+          fi
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme MeloNX \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            OTHER_LDFLAGS="$LINK_DYLIB" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP="$(find build/Build/Products -name 'MeloNX.app' -type d | head -n 1)"
+          if [ -z "$APP" ]; then
+            echo "MeloNX.app wurde nach dem Build nicht gefunden."
+            find build -maxdepth 6 -type d | sort
+            exit 66
+          fi
+
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r MeloNX-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeloNX-unsigned-ipa
+          path: MeloNX-unsigned.ipa
